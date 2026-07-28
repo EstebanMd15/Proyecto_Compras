@@ -85,8 +85,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--salida", default="Salida")
     ap.add_argument("--periodo", required=True, help="ej: 2026-03")
-    ap.add_argument("--tabla", default="dispensacion_raw")
-    ap.add_argument("--bd", default="mennar_dispensacion")
+    ap.add_argument("--tabla", default="dispensacion_acum")
+    ap.add_argument("--bd", default="mennar_bi")
     args = ap.parse_args()
 
     out = Path(args.salida)
@@ -139,7 +139,7 @@ def main():
         "  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
         f"USE `{args.bd}`;",
         "",
-        f"CREATE TABLE IF NOT EXISTS `{args.tabla}_{args.periodo}` (",
+        f"CREATE TABLE IF NOT EXISTS `{args.tabla}` (",
         "  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,",
         "  `periodo` CHAR(7) NOT NULL COMMENT 'AAAA-MM del reporte',",
         "  `cargado_en` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,",
@@ -182,7 +182,7 @@ def main():
         "  `id`,",
         "  `periodo`,",
         f"  {sel}",
-        f"FROM `{args.tabla}_{args.periodo}`;",
+        f"FROM `{args.tabla}`;",
         "",
         "-- ================================================================",
         "-- VISTA TIPADA: convierte fechas sin tocar la tabla base.",
@@ -195,7 +195,7 @@ def main():
         f"  STR_TO_DATE(NULLIF(TRIM(`{cols[4]['sql']}`), ''), '%d/%m/%Y')",
         f"    AS `{cols[4]['sql']}_fecha`,",
         f"  {sel}",
-        f"FROM `{args.tabla}_{args.periodo}`",
+        f"FROM `{args.tabla}`",
         f"WHERE TRIM(`{cols[4]['sql']}`) NOT LIKE '/%';",
         "",
         "-- ================================================================",
@@ -207,7 +207,7 @@ def main():
         "",
         "-- Quien SI necesite datos de paciente: acceso explicito y justificado.",
         "-- CREATE USER IF NOT EXISTS 'auditor'@'%' IDENTIFIED BY 'CAMBIA_ESTA_CLAVE';",
-        f"-- GRANT SELECT ON `{args.bd}`.`{args.tabla}_{args.periodo}` TO 'auditor'@'%';",
+        f"-- GRANT SELECT ON `{args.bd}`.`{args.tabla}` TO 'auditor'@'%';",
         "",
         "FLUSH PRIVILEGES;",
     ]
@@ -227,7 +227,7 @@ def main():
         chks.append(
             f"SELECT '{c['orig']}' AS columna, `{c['sql']}`(1,64) AS valor_invalido, "
             f"COUNT(*) AS filas\n"
-            f"  FROM `{args.tabla}_{args.periodo}`\n"
+            f"  FROM `{args.tabla}`\n"
             f" WHERE `periodo` = '{args.periodo}' AND `{c['sql']}` NOT IN ({lst})\n"
             f" GROUP BY 2"
         )
@@ -238,7 +238,7 @@ def main():
         chks.append(
             f"SELECT {q(c['orig'])} AS columna, LEFT(`{c['sql']}`, 60) AS valor_invalido,\n"
             f"       COUNT(*) AS filas\n"
-            f"  FROM `{args.tabla}_{args.periodo}`\n"
+            f"  FROM `{args.tabla}`\n"
             f" WHERE `periodo` = '{args.periodo}'\n"
             f"   AND `{c['sql']}` NOT IN ({lst})\n"
             f" GROUP BY 1, 2"
@@ -281,7 +281,7 @@ BEGIN
   SELECT COUNT(*) INTO v_faltan
     FROM `_esperadas` e
     LEFT JOIN information_schema.columns c
-      ON c.table_schema = '{args.bd}' AND c.table_name = '{args.tabla}_{args.periodo}'
+      ON c.table_schema = '{args.bd}' AND c.table_name = '{args.tabla}'
      AND c.column_name = e.col
    WHERE c.column_name IS NULL;
 
@@ -289,7 +289,7 @@ BEGIN
   SELECT COUNT(*) INTO v_sobran
     FROM information_schema.columns c
     LEFT JOIN `_esperadas` e ON e.col = c.column_name
-   WHERE c.table_schema = '{args.bd}' AND c.table_name = '{args.tabla}_{args.periodo}'
+   WHERE c.table_schema = '{args.bd}' AND c.table_name = '{args.tabla}'
      AND c.column_name NOT IN ('id','periodo','cargado_en')
      AND e.col IS NULL;
 
@@ -309,10 +309,10 @@ CALL `_preflight`();
 DROP PROCEDURE `_preflight`;
 
 -- ---------------- 2. CARGA ----------------
-DELETE FROM `{args.tabla}_{args.periodo}` WHERE `periodo` = '{args.periodo}';
+DELETE FROM `{args.tabla}` WHERE `periodo` = '{args.periodo}';
 
 LOAD DATA INFILE '{ruta_abs}'
-INTO TABLE `{args.tabla}_{args.periodo}`
+INTO TABLE `{args.tabla}`
 CHARACTER SET utf8mb4
 FIELDS TERMINATED BY '{SEP}'
        OPTIONALLY ENCLOSED BY '"'
@@ -333,7 +333,7 @@ SELECT
   {len(filas)} AS esperadas,
   IF(COUNT(*) = {len(filas)}, 'OK', 'MAL: revisar fin de linea y separador')
     AS veredicto
-FROM `{args.tabla}_{args.periodo}` WHERE `periodo` = '{args.periodo}';
+FROM `{args.tabla}` WHERE `periodo` = '{args.periodo}';
 
 -- 3b. Dominios: cualquier fila devuelta aqui esta CORRIDA.
 -- Vacio = la carga respeto la alineacion de las columnas.
