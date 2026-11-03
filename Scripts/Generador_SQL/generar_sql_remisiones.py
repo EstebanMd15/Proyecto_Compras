@@ -480,7 +480,7 @@ DROP PROCEDURE `_preflight`;
 -- ---------------- 2. CARGA ----------------
 DELETE FROM `{args.tabla}` WHERE `periodo` = '{args.periodo}';
 
-LOAD DATA INFILE '{ruta_abs}'
+LOAD DATA LOCAL INFILE '{ruta_abs}'
 INTO TABLE `{args.tabla}`
 CHARACTER SET utf8mb4
 FIELDS TERMINATED BY '{SEP}'

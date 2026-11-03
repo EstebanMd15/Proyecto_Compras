@@ -87,6 +87,21 @@ def main():
     ap.add_argument("--periodo", required=True, help="ej: 2026-03")
     ap.add_argument("--tabla", default="dispensacion_acum")
     ap.add_argument("--bd", default="mennar_bi")
+    # Catalogo de codigos de sucursal (ya existe como tabla en MySQL).
+    # Se cruza Bodega Encabezado contra el nombre de la sucursal para traer su codigo.
+    ap.add_argument("--cat-tabla", default="codigos_sucursales",
+                    help="tabla catalogo con los codigos de sucursal")
+    ap.add_argument("--cat-col-nombre", default="Sucursal",
+                    help="columna del catalogo que cruza con Bodega Encabezado")
+    ap.add_argument("--cat-col-codigo", default="Codigo Bodega",
+                    help="columna del catalogo que trae el codigo")
+    ap.add_argument("--col-cruce", default="Bodega Encabezado",
+                    help="columna del reporte que cruza con el catalogo de sucursales")
+    ap.add_argument("--col-codigo", default="codigo_bodega",
+                    help="nombre de la columna nueva en la tabla de dispensacion")
+    ap.add_argument("--col-codigo-anterior", default="codigo_tipo_comprobante",
+                    help="nombre viejo a migrar con CHANGE COLUMN (conserva datos); "
+                         "vacio o igual a --col-codigo para no migrar")
     args = ap.parse_args()
 
     out = Path(args.salida)
@@ -103,11 +118,87 @@ def main():
     print(f"Filas   : {len(filas)}  |  Columnas: {len(encabezado)}")
     print(f"Periodo : {args.periodo}")
 
-    usados = {"id", "periodo", "cargado_en"}
+    usados = {"id", "periodo", "cargado_en", args.col_codigo}
     cols = []
     for i, orig in enumerate(encabezado):
         cols.append({"i": i, "orig": orig.strip(),
                      "sql": sanear(orig, usados), "pii": es_pii(orig)})
+
+    # Columna del reporte que cruza con el catalogo de sucursales (Bodega
+    # Encabezado). Se busca por el nombre original del encabezado, no por
+    # posicion, y se aborta con mensaje claro si el reporte no la trae.
+    _cruce = next((c for c in cols
+                   if c["orig"].strip().lower() == args.col_cruce.strip().lower()), None)
+    if _cruce is None:
+        raise SystemExit(f"[X] No encontre la columna '{args.col_cruce}' en el "
+                         f"encabezado del reporte. Revisa --col-cruce.")
+    col_cruce = _cruce["sql"]
+
+    # Columna que precede a la de cruce -> el codigo se inserta ANTES de
+    # Bodega Encabezado (MySQL no tiene BEFORE: se usa AFTER la anterior).
+    i_cruce = _cruce["i"]
+    col_antes = cols[i_cruce - 1]["sql"] if i_cruce > 0 else None
+    tras = f" AFTER `{col_antes}`" if col_antes else " FIRST"
+
+    i_cruce = _cruce["i"]
+    col_antes = cols[i_cruce - 1]["sql"] if i_cruce > 0 else None
+
+    # Normalizacion del cruce. DEBE ser identica en ambos lados o no emparejan:
+    # quita espacios, luego comillas dobles envolventes, luego espacios otra vez
+    # (por si al quitar la comilla queda un espacio pegado).
+    def norm(ref):
+        # colapsa runs de 2+ espacios a 1, quita comillas envolventes y recorta
+        ref2 = f"REGEXP_REPLACE({ref}, ' +', ' ')"
+        return f"TRIM(TRIM(BOTH '\"' FROM TRIM({ref2})))"
+    norm_cat = norm(f"`{args.cat_col_nombre}`")     # lado catalogo
+    norm_disp = norm(f"d.`{col_cruce}`")            # lado dispensacion
+
+    def limpiar_espacios(where_sql):
+        # deja `col_cruce` con 1 solo espacio entre palabras (reescribe el valor)
+        return [
+            f"-- Normaliza espacios de `{col_cruce}`: colapsa 2+ a 1 y recorta.",
+            f"UPDATE `{args.tabla}`",
+            f"SET `{col_cruce}` = REGEXP_REPLACE(TRIM(`{col_cruce}`), ' +', ' ')"
+            f"{where_sql};",
+        ]
+
+    def bloque_codigo(proc, where_sql):
+        """Procedimiento que llena la columna del codigo cruzando contra el
+        catalogo. Va dentro de un guard: si el catalogo no existe, avisa y no
+        rompe el script. Usa una temporal indexada (rapido, no tumba conexion)
+        y LEFT JOIN (una bodega sin codigo queda en NULL). where_sql filtra el
+        UPDATE por periodo ('' = todas las filas)."""
+        return [
+            f"DROP PROCEDURE IF EXISTS `{proc}`;",
+            "DELIMITER $$",
+            f"CREATE PROCEDURE `{proc}`()",
+            "BEGIN",
+            "  IF NOT EXISTS (SELECT 1 FROM information_schema.tables",
+            f"                 WHERE table_schema = '{args.bd}'",
+            f"                   AND table_name = '{args.cat_tabla}') THEN",
+            f"    SELECT 'AVISO: no existe {args.cat_tabla}; "
+            f"`{args.col_codigo}` queda en NULL' AS aviso;",
+            "  ELSE",
+            "    DROP TEMPORARY TABLE IF EXISTS `_cat_suc`;",
+            "    CREATE TEMPORARY TABLE `_cat_suc` (",
+            "      `nombre` VARCHAR(190) NOT NULL,",
+            "      `codigo` VARCHAR(64) NULL,",
+            "      KEY `ix_nombre` (`nombre`)",
+            "    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
+            "    INSERT INTO `_cat_suc` (`nombre`, `codigo`)",
+            f"    SELECT {norm_cat}, MAX(`{args.cat_col_codigo}`)",
+            f"      FROM `{args.cat_tabla}` GROUP BY 1;",
+            f"    UPDATE `{args.tabla}` d",
+            "      LEFT JOIN `_cat_suc` c",
+            f"        ON c.`nombre` = {norm_disp}",
+            f"    SET d.`{args.col_codigo}` = c.`codigo`{where_sql};",
+            "    DROP TEMPORARY TABLE `_cat_suc`;",
+            "  END IF;",
+            "END$$",
+            "DELIMITER ;",
+            f"CALL `{proc}`();",
+            f"DROP PROCEDURE `{proc}`;",
+        ]
 
     n_pii = sum(1 for c in cols if c["pii"])
     print(f"\nColumnas con datos personales/salud: {n_pii}")
@@ -145,6 +236,10 @@ def main():
         "  `cargado_en` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,",
     ]
     for c in cols:
+        if c["sql"] == col_cruce:
+            # codigo de sucursal, pegado justo ANTES de Bodega Encabezado
+            L.append(f"  `{args.col_codigo}` VARCHAR(64) NULL "
+                     f"COMMENT {q('Codigo Bodega del catalogo ' + args.cat_tabla)},")
         L.append(f"  `{c['sql']}` TEXT NULL COMMENT {q(c['orig'])},")
     L += [
         "  PRIMARY KEY (`id`),",
@@ -168,6 +263,76 @@ def main():
         L.append(f"REPLACE INTO `columnas_mapeo` VALUES "
                  f"({c['i']}, {q(c['orig'])}, '{c['sql']}', {1 if c['pii'] else 0});")
 
+    # =====================================================================
+    # CODIGO DE SUCURSAL: columna nueva (o migrada) + backfill de lo cargado
+    # =====================================================================
+    comentario_col = q("Codigo Bodega (" + args.cat_tabla + ") por " + args.col_cruce)
+    anterior = (args.col_codigo_anterior or "").strip()
+    migra = bool(anterior) and anterior != args.col_codigo
+
+    L += [
+        "",
+        "-- ================================================================",
+        f"-- CODIGO DE SUCURSAL. Deja lista la columna `{args.col_codigo}`",
+        (f"-- (la crea, o migra la vieja `{anterior}` conservando sus datos) y"
+         if migra else "-- (la crea si la tabla ya existia sin ella) y"),
+        f"-- llena TODAS las filas cruzando `{col_cruce}` contra `{args.cat_tabla}`.",
+        "-- Idempotente: se puede volver a correr sin dañar nada.",
+        "-- ================================================================",
+        "DROP PROCEDURE IF EXISTS `_add_col_codigo`;",
+        "DELIMITER $$",
+        "CREATE PROCEDURE `_add_col_codigo`()",
+        "BEGIN",
+        "  DECLARE v_nuevo INT DEFAULT 0;",
+    ]
+    if migra:
+        L.append("  DECLARE v_viejo INT DEFAULT 0;")
+    L += [
+        "  SELECT COUNT(*) INTO v_nuevo FROM information_schema.columns",
+        f"   WHERE table_schema = '{args.bd}' AND table_name = '{args.tabla}'",
+        f"     AND column_name = '{args.col_codigo}';",
+    ]
+    if migra:
+        L += [
+            "  SELECT COUNT(*) INTO v_viejo FROM information_schema.columns",
+            f"   WHERE table_schema = '{args.bd}' AND table_name = '{args.tabla}'",
+            f"     AND column_name = '{anterior}';",
+            "  IF v_nuevo = 0 AND v_viejo > 0 THEN",
+            "    -- migra el nombre viejo conservando los datos ya llenos",
+            f"    ALTER TABLE `{args.tabla}`",
+            f"      CHANGE COLUMN `{anterior}` `{args.col_codigo}` VARCHAR(64) NULL",
+            f"      COMMENT {comentario_col}{tras};",
+            "  ELSEIF v_nuevo = 0 THEN",
+            "    -- no existe ninguna: la crea nueva",
+            f"    ALTER TABLE `{args.tabla}`",
+            f"      ADD COLUMN `{args.col_codigo}` VARCHAR(64) NULL",
+            f"      COMMENT {comentario_col}{tras};",
+            "  END IF;",
+        ]
+    else:
+        L += [
+            "  IF v_nuevo = 0 THEN",
+            f"    ALTER TABLE `{args.tabla}`",
+            f"      ADD COLUMN `{args.col_codigo}` VARCHAR(64) NULL",
+            f"      COMMENT {comentario_col}{tras};",
+            "  END IF;",
+        ]
+    L += [
+        "END$$",
+        "DELIMITER ;",
+        "CALL `_add_col_codigo`();",
+        "DROP PROCEDURE `_add_col_codigo`;",
+        "",
+        "-- Backfill (una vez): primero normaliza los espacios de la bodega y",
+        "-- luego llena la columna del codigo cruzando contra el catalogo. Con",
+        "-- guard: si el catalogo no existe, avisa y NO rompe la creacion del",
+        "-- esquema. En instalacion de cero la tabla esta vacia, asi que aqui no",
+        "-- cambia nada; cada periodo se llena solo en su cargar_<periodo>.sql.",
+    ]
+    L += limpiar_espacios("")
+    L += bloque_codigo("_backfill_codigo", "")
+    L += [""]
+
     publicas = [c for c in cols if not c["pii"]]
     sel = ",\n  ".join(f"`{c['sql']}`" for c in publicas)
     L += [
@@ -181,6 +346,7 @@ def main():
         "SELECT",
         "  `id`,",
         "  `periodo`,",
+        f"  `{args.col_codigo}`,",
         f"  {sel}",
         f"FROM `{args.tabla}`;",
         "",
@@ -192,6 +358,7 @@ def main():
         "SELECT",
         "  `id`,",
         "  `periodo`,",
+        f"  `{args.col_codigo}`,",
         f"  STR_TO_DATE(NULLIF(TRIM(`{cols[4]['sql']}`), ''), '%d/%m/%Y')",
         f"    AS `{cols[4]['sql']}_fecha`,",
         f"  {sel}",
@@ -221,17 +388,13 @@ def main():
     esperadas = ",\n  ".join(f"('{c['sql']}')" for c in cols)
     campos_load = ",\n  ".join(f"`{c['sql']}`" for c in cols)
 
-    chks = []
-    for c, vals in dominios:
-        lst = ", ".join(q(v) for v in vals)
-        chks.append(
-            f"SELECT '{c['orig']}' AS columna, `{c['sql']}`(1,64) AS valor_invalido, "
-            f"COUNT(*) AS filas\n"
-            f"  FROM `{args.tabla}`\n"
-            f" WHERE `periodo` = '{args.periodo}' AND `{c['sql']}` NOT IN ({lst})\n"
-            f" GROUP BY 2"
-        )
-    # sintaxis valida: sin el (1,64)
+    # Columnas que el preflight NO debe contar como "sobrantes": las fijas y la
+    # del codigo. Se incluye tambien el nombre viejo por si aun no se ha migrado.
+    ignora = ["id", "periodo", "cargado_en", args.col_codigo]
+    if migra:
+        ignora.append(anterior)
+    ignora_sql = ",".join("'" + x + "'" for x in ignora)
+
     chks = []
     for c, vals in dominios:
         lst = ", ".join(q(v) for v in vals)
@@ -244,6 +407,12 @@ def main():
             f" GROUP BY 1, 2"
         )
     union_chk = "\nUNION ALL\n".join(chks) if chks else "SELECT 'sin dominios' AS columna"
+
+    # bloque 2b: normaliza espacios de la bodega y luego llena el codigo de
+    # ESTE periodo (mismo guard de catalogo)
+    bloque_2b = "\n".join(
+        limpiar_espacios(f" WHERE `periodo` = '{args.periodo}'")
+        + bloque_codigo("_codigo_periodo", f" WHERE d.`periodo` = '{args.periodo}'"))
 
     carga = f"""-- ================================================================
 -- CARGA DEL PERIODO {args.periodo}
@@ -274,7 +443,7 @@ BEGIN
 
   IF @@sql_mode NOT LIKE '%STRICT_TRANS_TABLES%' THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-      'ABORTADO: modo estricto apagado. MySQL degradaria errores a warnings. Corre: SET GLOBAL sql_mode = CONCAT(@@sql_mode, ",STRICT_TRANS_TABLES");';
+      'ABORTADO: falta STRICT_TRANS_TABLES en @@sql_mode. MySQL degradaria errores a warnings. Activalo antes de cargar.';
   END IF;
 
   -- columnas del CSV que no existen en la tabla
@@ -290,14 +459,13 @@ BEGIN
     FROM information_schema.columns c
     LEFT JOIN `_esperadas` e ON e.col = c.column_name
    WHERE c.table_schema = '{args.bd}' AND c.table_name = '{args.tabla}'
-     AND c.column_name NOT IN ('id','periodo','cargado_en')
+     AND c.column_name NOT IN ({ignora_sql})
      AND e.col IS NULL;
 
   IF v_faltan > 0 OR v_sobran > 0 THEN
-    SET v_msg = CONCAT('ABORTADO: el reporte cambio de estructura. ',
-                       v_faltan, ' columnas nuevas en el CSV, ',
-                       v_sobran, ' columnas de la tabla que ya no vienen. ',
-                       'Cargar asi meteria todo corrido. Revisar antes de seguir.');
+    SET v_msg = CONCAT('ABORTADO: estructura cambiada. ',
+                       v_faltan, ' cols nuevas en CSV, ',
+                       v_sobran, ' cols que sobran en la tabla. Revisar antes de cargar.');
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
   END IF;
 
@@ -311,7 +479,7 @@ DROP PROCEDURE `_preflight`;
 -- ---------------- 2. CARGA ----------------
 DELETE FROM `{args.tabla}` WHERE `periodo` = '{args.periodo}';
 
-LOAD DATA INFILE '{ruta_abs}'
+LOAD DATA LOCAL INFILE '{ruta_abs}'
 INTO TABLE `{args.tabla}`
 CHARACTER SET utf8mb4
 FIELDS TERMINATED BY '{SEP}'
@@ -325,6 +493,23 @@ SET `periodo` = '{args.periodo}';
 
 -- Los warnings de LOAD DATA se pierden con la siguiente sentencia. Mirar YA.
 SHOW WARNINGS;
+
+-- ---------------- 2b. CODIGO DE SUCURSAL ----------------
+-- Llena `{args.col_codigo}` cruzando Bodega Encabezado contra `{args.cat_tabla}`.
+-- El catalogo se normaliza UNA vez en una temporal indexada por nombre, para
+-- que el UPDATE haga busquedas por indice y no un escaneo con TRIM en ambos
+-- lados (eso tumbaba la conexion: Error 2013). LEFT JOIN: una bodega sin
+-- codigo queda en NULL. Guard: si no existe el catalogo, avisa y no rompe.
+-- Se llena solo cada mes.
+{bloque_2b}
+
+-- Bodegas de este periodo que NO estan en el catalogo (quedaron sin codigo).
+-- Si sale algo: agrega ese nombre a `{args.cat_tabla}` y vuelve a correr el UPDATE.
+SELECT d.`{col_cruce}` AS bodega_sin_codigo, COUNT(*) AS filas
+  FROM `{args.tabla}` d
+ WHERE d.`periodo` = '{args.periodo}' AND d.`{args.col_codigo}` IS NULL
+ GROUP BY d.`{col_cruce}`
+ ORDER BY filas DESC;
 
 -- ---------------- 3. VERIFICACION ----------------
 -- 3a. Conteo: debe dar exactamente {len(filas)}
@@ -346,5 +531,10 @@ FROM `{args.tabla}` WHERE `periodo` = '{args.periodo}';
     print(f"\n     {len(cols)} columnas TEXT (sin VARCHAR: nada se recorta)")
     print(f"     {len(dominios)} dominios se verifican tras cargar")
     print(f"     debe cargar {len(filas)} filas")
+    print(f"     codigo: `{args.col_codigo}` = {args.cat_tabla}.`{args.cat_col_codigo}`"
+          f"  (cruce por `{col_cruce}`, se llena solo)")
+    if migra:
+        print(f"     migra columna vieja `{anterior}` -> `{args.col_codigo}` "
+              f"(CHANGE COLUMN, conserva datos)")
 if __name__ == "__main__":
     main()
